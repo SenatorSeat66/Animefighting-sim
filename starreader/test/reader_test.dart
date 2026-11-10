@@ -1,3 +1,9 @@
+import 'dart:io';
+
+import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
+import 'package:starreader/core/library_updates.dart';
+import 'package:starreader/core/extensions.dart';
+
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -10,6 +16,17 @@ import 'package:starreader/reader.dart';
 import 'widget_test.dart' show MemoryStorage, EmptySource;
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+      .setMockMethodCallHandler(LibraryUpdates.channel, (call) async => null);
+  setUp(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          ExtensionBridge.channel,
+          (call) async => call.method == 'list' ? <dynamic>[] : null,
+        );
+  });
+
   testWidgets(
     'offline reader restores position, turns pages, saves bookmark and changes mode',
     (tester) async {
@@ -52,7 +69,85 @@ void main() {
       await tester.pumpAndSettle();
       await tester.tap(find.text('Continuous'));
       await tester.pumpAndSettle();
-      expect(l.settings['readerMode'], 'webtoon');
+      expect(l.readerPreferences(m.id).mode, 'webtoon');
+      expect(l.readerPreferences('another-story').mode, 'paged');
+      await tester.pumpWidget(const SizedBox());
+      await tester.pump();
+    },
+  );
+  testWidgets(
+    'long strip restores its intra-page offset and completes only at the bottom',
+    (tester) async {
+      tester.view.physicalSize = const Size(400, 800);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final storage = MemoryStorage();
+      final l = Library(storage, source: EmptySource());
+      await l.init();
+      const m = Manga(id: 'local-long', title: 'Long strip', source: 'local');
+      const c = Chapter(
+        id: 'local-strip',
+        mangaId: 'local-long',
+        title: 'One long image',
+        pages: 1,
+      );
+      await storage.putPage(
+        c.id,
+        0,
+        File('test/fixtures/long_strip.png').readAsBytesSync(),
+      );
+      l.section('chapters')[m.id] = [c.toJson()];
+      await l.setting('readerMode', 'webtoon');
+      Widget reader() => ChangeNotifierProvider.value(
+        value: l,
+        child: const MaterialApp(
+          home: Reader(manga: m, chapter: c),
+        ),
+      );
+      await tester.pumpWidget(reader());
+      await tester.pumpAndSettle();
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 80)),
+      );
+      await tester.pumpAndSettle();
+      expect(l.progress(c.id)['complete'], false);
+      await tester.drag(
+        find.byType(ScrollablePositionedList),
+        const Offset(0, -2000),
+      );
+      await tester.pumpAndSettle();
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 80)),
+      );
+      await tester.pumpAndSettle();
+      await tester.pump(const Duration(milliseconds: 400));
+      final offset = (l.progress(c.id)['offset'] as num).toDouble();
+      expect(offset, lessThan(-1));
+      expect(l.progress(c.id)['complete'], false);
+      await tester.pumpWidget(const SizedBox());
+      await tester.pump();
+      await tester.pumpWidget(reader());
+      await tester.pumpAndSettle();
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 80)),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        (l.progress(c.id)['offset'] as num).toDouble(),
+        closeTo(offset, .2),
+      );
+      await tester.drag(
+        find.byType(ScrollablePositionedList),
+        const Offset(0, -16000),
+      );
+      await tester.pumpAndSettle();
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 80)),
+      );
+      await tester.pumpAndSettle();
+      await tester.pump(const Duration(milliseconds: 400));
+      expect(l.progress(c.id)['complete'], true);
       await tester.pumpWidget(const SizedBox());
       await tester.pump();
     },

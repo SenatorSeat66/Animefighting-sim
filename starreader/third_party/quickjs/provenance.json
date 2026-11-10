@@ -1,0 +1,23 @@
+{
+  "generated_by": "CodeRabbit Coding Agent",
+  "engine": {
+    "url": "https://bellard.org/quickjs/quickjs-2026-06-04.tar.xz",
+    "version": "2026-06-04",
+    "sha256": "b376e839b322978313d929fd20663b11ba58b75df5a46c126dd19ea2fa70ad2a",
+    "license": "MIT"
+  },
+  "jni_binding": {
+    "url": "https://github.com/zhanghai/quickjs-java",
+    "revision": "547f5b1597",
+    "archive_sha256": "bf913fc8afd1b2a23ec6c7d76723ab8e52d8578be26a0e475e02b8fda1145312",
+    "license": "Apache-2.0"
+  },
+  "changes": [
+    "Current QuickJS engine with existing app.cash.quickjs Java/JNI contract",
+    "64 MiB per runtime and 1 MiB JS stack limit",
+    "20 second execution deadline reset per evaluation, compile, execute and bound JS call",
+    "2 million character evaluation input limit",
+    "Constructor cleanup guards for failed native allocation",
+    "Android ARM64 build with 16 KiB ELF page alignment; no filesystem/network std/os module"
+  ]
+}

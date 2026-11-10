@@ -1,3 +1,5 @@
+import 'package:starreader/core/library_updates.dart';
+
 import 'dart:async';
 import 'dart:typed_data';
 
@@ -23,6 +25,9 @@ Future<void> idle(Library l) async {
 }
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+      .setMockMethodCallHandler(LibraryUpdates.channel, (call) async => null);
   const manga = Manga(id: 'm', title: 'Title');
   const chapter = Chapter(id: 'c', mangaId: 'm', title: 'Chapter', pages: 2);
   test(

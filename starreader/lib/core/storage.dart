@@ -16,8 +16,18 @@ class Storage {
     }
     db = await openDatabase(
       p.join(await getDatabasesPath(), 'starreader.db'),
-      version: 1,
+      version: 2,
+      onUpgrade: (d, old, next) async {
+        if (old < 2) {
+          await d.execute(
+            'CREATE TABLE cache (key TEXT PRIMARY KEY, json TEXT NOT NULL)',
+          );
+        }
+      },
       onCreate: (d, v) async {
+        await d.execute(
+          'CREATE TABLE cache (key TEXT PRIMARY KEY, json TEXT NOT NULL)',
+        );
         await d.execute(
           'CREATE TABLE state (id INTEGER PRIMARY KEY, json TEXT NOT NULL)',
         );
@@ -26,6 +36,31 @@ class Storage {
         );
       },
     );
+  }
+
+  final Map<String, String> _memoryCache = {};
+  Future<String?> readCache(String key) async {
+    if (kIsWeb) return prefs?.getString('cache.$key');
+    if (db == null) return _memoryCache[key];
+    return (await db!.query(
+          'cache',
+          where: 'key = ?',
+          whereArgs: [key],
+        )).firstOrNull?['json']
+        as String?;
+  }
+
+  Future<void> writeCache(String key, String value) async {
+    if (kIsWeb) {
+      await prefs!.setString('cache.$key', value);
+    } else if (db == null) {
+      _memoryCache[key] = value;
+    } else {
+      await db!.insert('cache', {
+        'key': key,
+        'json': value,
+      }, conflictAlgorithm: ConflictAlgorithm.replace);
+    }
   }
 
   Future<Map<String, dynamic>> load() async {

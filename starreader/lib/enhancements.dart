@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import 'core/library.dart';
+import 'core/extensions.dart';
 import 'core/models.dart';
 import 'main.dart' show MangaTile, openManga, Empty, guard, message;
 import 'reader.dart';
@@ -18,7 +19,16 @@ class _CatalogueRailState extends State<CatalogueRail> {
   @override
   void initState() {
     super.initState();
-    request = context.read<Library>().source.search(sort: widget.sort);
+    request = fetch();
+  }
+
+  Future<List<Manga>> fetch() {
+    final selected = context.read<Library>().source;
+    // Home rails must not reset Discover's pagination or inherit its filters.
+    final source = selected is ExtensionMangaSource
+        ? ExtensionMangaSource(selected.info)
+        : selected;
+    return source.search(sort: widget.sort);
   }
 
   @override
@@ -46,11 +56,9 @@ class _CatalogueRailState extends State<CatalogueRail> {
                     ),
                   ),
                   TextButton(
-                    onPressed: () => setState(
-                      () => request = context.read<Library>().source.search(
-                        sort: widget.sort,
-                      ),
-                    ),
+                    onPressed: () => setState(() {
+                      request = fetch();
+                    }),
                     child: const Text('Retry'),
                   ),
                 ],
@@ -95,8 +103,10 @@ class Bookmarks extends StatelessWidget {
                 'Bookmark pages from the reader toolbar.',
               ),
             )
-          : ListView(
-              children: entries.map((key) {
+          : ListView.builder(
+              itemCount: entries.length,
+              itemBuilder: (context, index) {
+                final key = entries[index];
                 final split = key.lastIndexOf(':');
                 final id = key.substring(0, split);
                 final page = int.tryParse(key.substring(split + 1)) ?? 0;
@@ -125,16 +135,18 @@ class Bookmarks extends StatelessWidget {
                     l.section('progress')[ch.id] = {
                       ...l.progress(ch.id),
                       'page': page,
+                      'offset': 0.0,
                     };
                     openReader(context, ma, ch);
                   },
                   trailing: IconButton(
                     tooltip: 'Remove bookmark',
-                    onPressed: () => l.bookmark(ch.id, page),
+                    onPressed: () =>
+                        guard(context, () => l.bookmark(ch.id, page)),
                     icon: const Icon(Icons.close),
                   ),
                 );
-              }).toList(),
+              },
             ),
     );
   }
@@ -152,14 +164,15 @@ class ReadingStats extends StatelessWidget {
         .length;
     final days = l.section('sessions').keys.toSet();
     int streak = 0;
-    var day = DateTime.now();
+    final now = DateTime.now();
+    var day = DateTime(now.year, now.month, now.day);
     String date(DateTime d) => d.toIso8601String().substring(0, 10);
     if (!days.contains(date(day))) {
-      day = day.subtract(const Duration(days: 1));
+      day = DateTime(day.year, day.month, day.day - 1);
     }
     while (days.contains(date(day))) {
       streak++;
-      day = day.subtract(const Duration(days: 1));
+      day = DateTime(day.year, day.month, day.day - 1);
     }
     return Card(
       margin: const EdgeInsets.all(24),
@@ -173,12 +186,14 @@ class ReadingStats extends StatelessWidget {
               style: TextStyle(fontSize: 19, fontWeight: FontWeight.w800),
             ),
             const SizedBox(height: 18),
-            Text('$streak day streak   ·   $read chapters finished'),
+            Text(
+              '$streak day streak   ·   $read ${read == 1 ? 'chapter' : 'chapters'} finished',
+            ),
             const SizedBox(height: 18),
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: List.generate(7, (i) {
-                final d = DateTime.now().subtract(Duration(days: 6 - i));
+                final d = DateTime(now.year, now.month, now.day - 6 + i);
                 final active = days.contains(date(d));
                 return Column(
                   children: [

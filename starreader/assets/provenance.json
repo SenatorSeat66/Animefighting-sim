@@ -2,5 +2,10 @@
   "generated_by": "CodeRabbit Coding Agent",
   "application": "StarReader",
   "original_artwork": "Geometric StarReader branding",
-  "third_party_font": "Manrope, SIL OFL; see OFL.txt"
+  "third_party_font": "Manrope, SIL OFL; see OFL.txt",
+  "third_party_fonts": {
+    "Manrope": "SIL OFL; assets/fonts/OFL.txt",
+    "Newsreader": "SIL OFL; assets/fonts/Newsreader-OFL.txt"
+  },
+  "native_notices": "assets/licenses/"
 }

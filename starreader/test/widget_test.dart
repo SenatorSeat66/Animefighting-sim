@@ -1,3 +1,6 @@
+import 'package:starreader/core/library_updates.dart';
+import 'package:starreader/core/extensions.dart';
+
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -62,6 +65,17 @@ class EmptySource implements MangaSource {
 }
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+  TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+      .setMockMethodCallHandler(LibraryUpdates.channel, (call) async => null);
+  setUp(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(
+          ExtensionBridge.channel,
+          (call) async => call.method == 'list' ? <dynamic>[] : null,
+        );
+  });
+
   const m = Manga(id: 'a', title: 'A title');
   const c = Chapter(id: 'c', mangaId: 'a', title: 'One', pages: 3);
   test('library, category and progress survive a restart', () async {

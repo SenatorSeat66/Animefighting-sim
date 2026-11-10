@@ -7,19 +7,58 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 import 'models.dart';
+import 'archive_input.dart';
+import 'archive_decoder.dart';
+import 'extensions.dart';
+import 'page_cache.dart';
+import 'image_dimensions.dart';
+import 'thumbnail_cache.dart';
+import 'background_downloads.dart';
+import 'library_updates.dart';
 import 'source.dart';
 import 'storage.dart';
+import 'reader_preferences.dart';
 
 class Library extends ChangeNotifier {
   final Storage storage;
-  final MangaSource source;
+  final MangaSource _defaultSource;
+  late final ExtensionManager extensions = ExtensionManager(storage)
+    ..addListener(() {
+      final revision = jsonEncode(
+        extensions.installed
+            .map(
+              (e) => {
+                'package': e.package,
+                'version': e.version,
+                'code': e.code,
+                'sources': e.sources.map((s) => s.toJson()).toList(),
+              },
+            )
+            .toList(),
+      );
+      if (_sourcesRevision != revision) {
+        _sourceCache.clear();
+        _sourcesRevision = revision;
+      }
+      notifyListeners();
+    });
+  final Map<String, ExtensionMangaSource> _sourceCache = {};
+  String _sourcesRevision = '';
+  MangaSource get source => extensions.selected.startsWith('ext:')
+      ? sourceFor(extensions.selected)
+      : _defaultSource;
+  MangaSource sourceFor(String id) => id.startsWith('ext:')
+      ? _sourceCache.putIfAbsent(id, () => extensions.source(id))
+      : _defaultSource;
   Library(
     this.storage, {
     MangaSource? source,
     Future<Uint8List> Function(String)? imageFetcher,
-  }) : source = source ?? MangaDexSource(),
+  }) : _defaultSource = source ?? MangaDexSource(),
        imageFetcher = imageFetcher ?? fetchImage;
   final Future<Uint8List> Function(String) imageFetcher;
+  final pageCache = PageCache();
+  final covers = ThumbnailCache();
   Map<String, dynamic> data = {};
   String? downloadError;
   bool running = false;
@@ -44,6 +83,8 @@ class Library extends ChangeNotifier {
   Future<void> init() async {
     await storage.open();
     data = await storage.load();
+    await extensions.init();
+    BackgroundDownloads.listen(pauseAllDownloads);
     for (final job in section('downloads').values) {
       if (job['status'] == 'downloading') {
         job['status'] = 'paused';
@@ -52,6 +93,10 @@ class Library extends ChangeNotifier {
     if (kIsWeb) {
       section('downloads').clear();
     }
+    await LibraryUpdates.bind(
+      (id) => updateLibrary(requestId: id),
+      cancelUpdate,
+    );
   }
 
   Future<void> persist() {
@@ -64,8 +109,161 @@ class Library extends ChangeNotifier {
   }
 
   Future<void> setting(String key, dynamic value) async {
+    final existed = settings.containsKey(key), old = settings[key];
     settings[key] = value;
+    if (key == 'readerMode' || key == 'rtl') {
+      final current = readerPreferences('_default').toJson();
+      current[key == 'readerMode' ? 'mode' : key] = value;
+      section('readerProfiles')['_default'] = current;
+    }
     await persist();
+    if (['updateHours', 'updateWifi', 'updateNotify'].contains(key)) {
+      try {
+        await LibraryUpdates.configure(settings);
+      } catch (_) {
+        if (existed) {
+          settings[key] = old;
+        } else {
+          settings.remove(key);
+        }
+        await persist();
+        rethrow;
+      }
+    }
+  }
+
+  ReaderPreferences readerPreferences(String mangaId) {
+    final global = Map<String, dynamic>.from(
+      section('readerProfiles')['_default'] ??
+          {
+            'mode': settings['readerMode'] ?? 'paged',
+            'rtl': settings['rtl'] == true,
+          },
+    );
+    final title = Map<String, dynamic>.from(
+      section('readerProfiles')[mangaId] ?? {},
+    );
+    return ReaderPreferences.fromJson({...global, ...title});
+  }
+
+  Future<void> saveReaderPreferences(
+    String mangaId,
+    ReaderPreferences value, {
+    bool global = false,
+  }) async {
+    section('readerProfiles')[global ? '_default' : mangaId] = value.toJson();
+    if (global) {
+      settings['readerMode'] = value.mode;
+      settings['rtl'] = value.rtl;
+    }
+    await persist();
+  }
+
+  Future<void> resetReaderPreferences(String mangaId) async {
+    section('readerProfiles').remove(mangaId);
+    await persist();
+  }
+
+  Future<void> prioritize(String id) async {
+    final job = section('downloads')[id];
+    if (job == null || job['status'] == 'complete') {
+      return;
+    }
+    final priorities = section('downloads').values
+        .map((j) => j['priority'] as int? ?? 0);
+    job['priority'] = priorities.fold<int>(0, (a, b) => a > b ? a : b) + 1;
+    await persist();
+  }
+
+  Future<void> resumeDownload(String id) async {
+    final job = section('downloads')[id];
+    if (job == null || ['complete', 'downloading'].contains(job['status'])) {
+      return;
+    }
+    job['status'] = 'queued';
+    job.remove('error');
+    await persist();
+    unawaited(runQueue());
+  }
+
+  bool updatingLibrary = false;
+  int updateDone = 0, updateTotal = 0;
+  String? _updateId;
+  void cancelUpdate(String id) {
+    if (_updateId == id) _updateId = null;
+  }
+
+  Future<Map<String, dynamic>> updateLibrary({String? requestId}) async {
+    if (updatingLibrary) return {'busy': true};
+    final id = requestId ?? 'manual-${DateTime.now().microsecondsSinceEpoch}';
+    final titles = saved.where((m) => m.source != 'local').toList();
+    updatingLibrary = true;
+    _updateId = id;
+    updateDone = 0;
+    updateTotal = titles.length;
+    final failures = <String, String>{};
+    int found = 0;
+    final timer = Stopwatch()..start();
+    final cursor = requestId == null
+        ? 0
+        : (section('updateState')['cursor'] as int? ?? 0) %
+              (titles.isEmpty ? 1 : titles.length);
+    notifyListeners();
+    try {
+      for (int i = 0; i < titles.length; i++) {
+        if (_updateId != id ||
+            (requestId != null && timer.elapsed.inMinutes >= 5)) {
+          break;
+        }
+        final m = titles[(cursor + i) % titles.length];
+        final existing = chapters(m.id).map((c) => c.id).toSet();
+        try {
+          final latest = await refresh(m);
+          if (existing.isNotEmpty) {
+            for (final chapter in latest.where(
+              (c) => !existing.contains(c.id),
+            )) {
+              found++;
+              section('updates')[chapter.id] = {
+                'chapter': chapter.toJson(),
+                'time': DateTime.now().toIso8601String(),
+              };
+            }
+          }
+        } catch (e) {
+          failures[m.id] = e.toString();
+        }
+        updateDone++;
+        section('updateState')['cursor'] = (cursor + i + 1) % titles.length;
+        notifyListeners();
+      }
+      final entries = section('updates');
+      while (entries.length > 5000) {
+        entries.remove(entries.keys.first);
+      }
+      section('updateState').addAll({
+        'time': DateTime.now().toIso8601String(),
+        'checked': updateDone,
+        'total': updateTotal,
+        'newChapters': found,
+        'failures': failures,
+        'cancelled': _updateId != id,
+      });
+      await persist();
+      return {
+        'newChapters': found,
+        'failed': failures.length,
+        'checked': updateDone,
+      };
+    } finally {
+      updatingLibrary = false;
+      _updateId = null;
+      notifyListeners();
+    }
+  }
+
+  void stopLibraryUpdate() {
+    _updateId = null;
   }
 
   Future<void> remember(Manga m) async {
@@ -91,7 +289,16 @@ class Library extends ChangeNotifier {
     if (m.source == 'local') {
       return chapters(m.id);
     }
-    final list = await source.chapters(
+    final provider = sourceFor(m.source);
+    if (provider is ExtensionMangaSource) {
+      final result = await provider.update(m);
+      // Keep the original library identity even if a source normalizes its URL.
+      final updated = Manga.fromJson({...result.$1.toJson(), 'id': m.id});
+      section('chapters')[m.id] = result.$2.map((c) => c.toJson()).toList();
+      await remember(updated);
+      return result.$2;
+    }
+    final list = await provider.chapters(
       m.id,
       language: settings['language'] ?? 'en',
     );
@@ -105,22 +312,54 @@ class Library extends ChangeNotifier {
     if (job?['status'] == 'complete' || c.id.startsWith('local-')) {
       return List.generate(job?['total'] as int? ?? c.pages, (i) => 'local:$i');
     }
-    return source.pages(c.id);
+    return onlinePages(c);
   }
 
-  Future<void> position(Manga m, Chapter c, int page, int total) async {
+  Future<List<String>> onlinePages(Chapter c) {
+    final provider = sourceFor(
+      c.id.startsWith('ext:') ? c.id.split(':').take(2).join(':') : 'mangadex',
+    );
+    return provider is ExtensionMangaSource
+        ? provider.pageList(c)
+        : provider.pages(c.id);
+  }
+
+  Future<Uint8List> readPage(String chapter, int index, String url) =>
+      pageCache.get('$chapter/$index', () async {
+        final local = await storage.page(chapter, index);
+        if (local != null) return local;
+        if (url.startsWith('local:')) {
+          throw const FormatException(
+            'Offline page is missing. Import or download this chapter again.',
+          );
+        }
+        return imageFetcher(url);
+      });
+
+  Future<void> position(
+    Manga m,
+    Chapter c,
+    int page,
+    int total, {
+    double offset = 0,
+    bool? completed,
+  }) async {
     section('sessions')[DateTime.now().toIso8601String().substring(0, 10)] =
         true;
     section('manga')[m.id] = m.toJson();
     section('progress')[c.id] = {
       'page': page,
+      'offset': offset,
       'total': total,
-      'complete': progress(c.id)['complete'] == true || page >= total - 1,
+      'complete':
+          progress(c.id)['complete'] == true ||
+          (completed ?? page >= total - 1),
       'time': DateTime.now().toIso8601String(),
     };
     section('history')[m.id] = {
       'chapter': c.toJson(),
       'page': page,
+      'offset': offset,
       'total': total,
       'time': DateTime.now().toIso8601String(),
     };
@@ -137,24 +376,60 @@ class Library extends ChangeNotifier {
     await persist();
   }
 
-  Future<void> enqueue(Manga m, Chapter c) async {
-    await remember(m);
-    final old = section('downloads')[c.id];
-    if (old?['status'] == 'complete' || old?['status'] == 'downloading') {
-      return;
+  Future<void> enqueue(Manga m, Chapter c) => enqueueBatch(m, [c]);
+  Future<void> enqueueBatch(Manga m, Iterable<Chapter> chapters) async {
+    final batch = chapters.toList();
+    if (batch.any((c) => c.mangaId != m.id)) {
+      throw const FormatException('Chapter belongs to a different title');
     }
-    section('downloads')[c.id] = {
-      'chapter': c.toJson(),
-      'status': 'queued',
-      'done': old?['done'] ?? 0,
-      'total': old?['total'] ?? c.pages,
-    };
+    section('manga')[m.id] = m.toJson();
+    bool changed = false;
+    for (final c in batch) {
+      final old = section('downloads')[c.id];
+      if (old?['status'] == 'complete' || old?['status'] == 'downloading') {
+        continue;
+      }
+      section('downloads')[c.id] = {
+        'chapter': c.toJson(),
+        'status': 'queued',
+        'done': old?['done'] ?? 0,
+        'total': old?['total'] ?? c.pages,
+        'priority': old?['priority'] ?? 0,
+        'queuedAt': old?['queuedAt'] ?? DateTime.now().microsecondsSinceEpoch,
+      };
+      changed = true;
+    }
+    if (!changed) return;
+    await persist();
+    unawaited(runQueue());
+  }
+
+  Future<void> pauseAllDownloads() async {
+    for (final job in section('downloads').values) {
+      if (['queued', 'downloading'].contains(job['status'])) {
+        job['status'] = 'paused';
+      }
+    }
+    await persist();
+  }
+
+  Future<void> resumeAllDownloads() async {
+    for (final job in section('downloads').values) {
+      if (['paused', 'failed'].contains(job['status'])) {
+        job['status'] = 'queued';
+        job.remove('error');
+      }
+    }
     await persist();
     unawaited(runQueue());
   }
 
   Future<void> pause(String id) async {
-    section('downloads')[id]['status'] = 'paused';
+    final job = section('downloads')[id];
+    if (job == null || job['status'] == 'complete') {
+      return;
+    }
+    job['status'] = 'paused';
     await persist();
   }
 
@@ -165,30 +440,64 @@ class Library extends ChangeNotifier {
       await Future<void>.delayed(const Duration(milliseconds: 100));
     }
     await storage.deletePages(id);
+    pageCache.clear();
+    covers.clear();
     section('downloads').remove(id);
     await persist();
   }
 
   String? active;
   Future<void> runQueue() async {
-    if (running) {
+    if (running ||
+        !section('downloads').values.any((j) => j['status'] == 'queued')) {
       return;
     }
+    downloadError = null;
     running = true;
     try {
+      try {
+        await BackgroundDownloads.start();
+      } catch (e) {
+        downloadError =
+            'Background service unavailable; keep StarReader open. $e';
+      }
       while (true) {
-        final entry = section('downloads').entries
-            .where((e) => e.value['status'] == 'queued')
-            .firstOrNull;
+        final queued =
+            section('downloads').entries
+                .where((e) => e.value['status'] == 'queued')
+                .toList()
+              ..sort((a, b) {
+                final priority = (b.value['priority'] as int? ?? 0).compareTo(
+                  a.value['priority'] as int? ?? 0,
+                );
+                return priority != 0
+                    ? priority
+                    : (a.value['queuedAt'] as int? ?? 0).compareTo(
+                        b.value['queuedAt'] as int? ?? 0,
+                      );
+              });
+        final entry = queued.firstOrNull;
         if (entry == null) {
           break;
         }
         final job = entry.value;
         active = entry.key;
         job['status'] = 'downloading';
+        job.remove('error');
+        final currentChapter = Chapter.fromJson(
+          Map<String, dynamic>.from(job['chapter']),
+        );
+        final title =
+            manga
+                .where((m) => m.id == currentChapter.mangaId)
+                .firstOrNull
+                ?.title ??
+            currentChapter.title;
         await persist();
         try {
-          final urls = await source.pages(entry.key);
+          final urls = await onlinePages(
+            Chapter.fromJson(Map<String, dynamic>.from(job['chapter'])),
+          );
           job['total'] = urls.length;
           if (urls.isEmpty) {
             throw const FormatException('Chapter has no readable pages');
@@ -206,6 +515,20 @@ class Library extends ChangeNotifier {
             }
             job['done'] = i + 1;
             await persist();
+            try {
+              await BackgroundDownloads.update(
+                title,
+                i + 1,
+                urls.length,
+                section('downloads').values
+                    .where(
+                      (j) => ['queued', 'downloading'].contains(j['status']),
+                    )
+                    .length,
+              );
+            } catch (_) {
+              /* Foreground reading remains available if notifications are restricted. */
+            }
           }
           if (job['status'] == 'downloading') {
             job['status'] = 'complete';
@@ -220,21 +543,42 @@ class Library extends ChangeNotifier {
         active = null;
         await persist();
       }
+    } catch (e) {
+      downloadError = 'Queue stopped: $e';
+      if (active != null) {
+        final job = section('downloads')[active];
+        if (job != null && job['status'] == 'downloading') {
+          job['status'] = 'failed';
+          job['error'] = e.toString();
+        }
+      }
     } finally {
+      try {
+        await BackgroundDownloads.stop();
+      } catch (_) {}
       running = false;
       active = null;
       notifyListeners();
     }
   }
 
-  static bool isImage(Uint8List b) =>
-      b.length > 12 &&
-      ((b[0] == 0xff && b[1] == 0xd8) ||
-          (b[0] == 137 && b[1] == 80 && b[2] == 78 && b[3] == 71) ||
-          (ascii.decode(b.sublist(0, 4), allowInvalid: true) == 'RIFF' &&
-              ascii.decode(b.sublist(8, 12), allowInvalid: true) == 'WEBP') ||
-          ascii.decode(b.sublist(0, 3), allowInvalid: true) == 'GIF');
+  static bool isImage(Uint8List bytes) {
+    try {
+      ImageDimensions.read(bytes);
+      return true;
+    } on FormatException {
+      return false;
+    }
+  }
+
   static Future<Uint8List> fetchImage(String url) async {
+    if (url.startsWith('extimg:')) {
+      final bytes = await ExtensionBridge.image(url);
+      if (!isImage(bytes)) {
+        throw const FormatException('Source returned an invalid image');
+      }
+      return bytes;
+    }
     final uri = Uri.parse(url);
     if (uri.scheme != 'https') {
       throw const FormatException('HTTPS required');
@@ -270,7 +614,19 @@ class Library extends ChangeNotifier {
     if (bytes.length > 250 * 1024 * 1024) {
       throw const FormatException('Archive exceeds 250 MB');
     }
-    final archive = ZipDecoder().decodeBytes(bytes);
+    await _importArchive(name, decodeCbz(InputMemoryStream(bytes)));
+  }
+
+  Future<void> importCbzPath(String name, String path) async {
+    final input = await openArchivePath(path);
+    try {
+      await _importArchive(name, input.archive);
+    } finally {
+      await input.close();
+    }
+  }
+
+  Future<void> _importArchive(String name, Archive archive) async {
     final files =
         archive.files
             .where(
@@ -294,14 +650,17 @@ class Library extends ChangeNotifier {
     final id = 'local-${DateTime.now().microsecondsSinceEpoch}';
     try {
       for (int i = 0; i < files.length; i++) {
-        final b = Uint8List.fromList(files[i].content);
+        final b = files[i].content;
         if (!isImage(b)) {
           throw const FormatException('Invalid image in archive');
         }
         await storage.putPage(id, i, b);
+        files[i].clear();
       }
     } catch (_) {
       await storage.deletePages(id);
+      pageCache.clear();
+      covers.clear();
       rethrow;
     }
     final m = Manga(
@@ -324,7 +683,16 @@ class Library extends ChangeNotifier {
       'done': files.length,
       'total': files.length,
     };
-    await toggle(m);
+    try {
+      await toggle(m);
+    } catch (_) {
+      section('chapters').remove(id);
+      section('downloads').remove(id);
+      section('manga').remove(id);
+      section('library').remove(id);
+      await storage.deletePages(id);
+      rethrow;
+    }
   }
 
   static int naturalCompare(String a, String b) {
@@ -391,22 +759,72 @@ class Library extends ChangeNotifier {
         e.key == m.id &&
             m.id.isNotEmpty &&
             m.title.length <= 2000 &&
-            ['local', 'mangadex'].contains(m.source),
+            (['local', 'mangadex'].contains(m.source) ||
+                RegExp(r'^ext:[0-9]+$').hasMatch(m.source)),
         'title',
       );
       require(
         m.cover.isEmpty ||
             (Uri.tryParse(m.cover)?.scheme == 'https' &&
-                Uri.tryParse(m.cover)?.host == 'uploads.mangadex.org'),
+                (Uri.tryParse(m.cover)?.host == 'uploads.mangadex.org' ||
+                    m.source.startsWith('ext:'))),
         'cover URL',
       );
+    }
+    void validateMetadata(Map<String, dynamic> metadata) {
+      require(
+        metadata.isEmpty ||
+            (metadata['url'] is String &&
+                (metadata['url'] as String).length <= 8192),
+        'source URL',
+      );
+      if (metadata['memo'] != null) {
+        require(
+          metadata['memo'] is String &&
+              (metadata['memo'] as String).length <= 1024 * 1024,
+          'source memo',
+        );
+        require(
+          jsonDecode(metadata['memo']) is Map<String, dynamic>,
+          'source memo object',
+        );
+      }
+    }
+
+    for (final value in (candidate['manga'] as Map? ?? {}).values) {
+      final m = Manga.fromJson(Map<String, dynamic>.from(value));
+      require(
+        !m.source.startsWith('ext:') || m.id.startsWith('${m.source}:'),
+        'source identity',
+      );
+      validateMetadata(m.metadata);
+    }
+    for (final list in (candidate['chapters'] as Map? ?? {}).values) {
+      for (final value in list as List) {
+        validateMetadata(
+          Chapter.fromJson(Map<String, dynamic>.from(value)).metadata,
+        );
+      }
     }
     for (final value in (candidate['library'] as Map? ?? {}).values) {
       require(
         value is Map &&
             value['category'] is String &&
             value['favorite'] is bool &&
-            value['added'] is String,
+            value['added'] is String &&
+            (value['collections'] == null ||
+                (value['collections'] is List &&
+                    (value['collections'] as List).every(
+                      (v) => v is String && v.length <= 40,
+                    ))) &&
+            (value['notes'] == null ||
+                (value['notes'] is String && value['notes'].length <= 10000)) &&
+            (value['tags'] == null ||
+                (value['tags'] is List &&
+                    value['tags'].length <= 30 &&
+                    (value['tags'] as List).every(
+                      (t) => t is String && t.length <= 40,
+                    ))),
         'library entry',
       );
     }
@@ -450,8 +868,16 @@ class Library extends ChangeNotifier {
         'accent' =>
           entry.value is int && entry.value >= 0 && entry.value <= 0xffffffff,
         'columns' => [2, 3, 4].contains(entry.value),
+        'imageCacheMb' => [32, 64, 96, 128].contains(entry.value),
+        'coverRatio' => [2 / 3, .75, 1.0].contains(entry.value),
+        'spacing' => [8, 14, 20].contains(entry.value),
+        'textScale' => [1.0, 1.15, 1.3].contains(entry.value),
+        'reduceMotion' || 'updateWifi' || 'updateNotify' => entry.value is bool,
+        'updateHours' => [0, 6, 12, 24, 72].contains(entry.value),
         'readerMode' => ['paged', 'vertical', 'webtoon'].contains(entry.value),
-        'language' => ['en', 'ja', 'es', 'pt-br', 'fr'].contains(entry.value),
+        'language' =>
+          entry.value is String &&
+              RegExp(r'^[a-z]{2,3}(-[a-z]{2,4})?$').hasMatch(entry.value),
         'rtl' || 'awake' || 'volume' || 'onboarded' => entry.value is bool,
         _ => false,
       };
@@ -467,6 +893,23 @@ class Library extends ChangeNotifier {
         'categories',
       );
     }
+    for (final key in ['sessions', 'readerProfiles']) {
+      require(
+        candidate[key] == null || candidate[key] is Map<String, dynamic>,
+        key,
+      );
+    }
+    for (final e in (candidate['sessions'] as Map? ?? {}).entries) {
+      require(
+        RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(e.key) &&
+            DateTime.tryParse(e.key) != null &&
+            e.value is bool,
+        'reading session',
+      );
+    }
+    for (final prefs in (candidate['readerProfiles'] as Map? ?? {}).values) {
+      require(ReaderPreferences.isValid(prefs), 'reader preferences');
+    }
     final previous = data;
     final merged = jsonDecode(jsonEncode(data)) as Map<String, dynamic>;
     for (final key in [
@@ -477,9 +920,18 @@ class Library extends ChangeNotifier {
       'progress',
       'bookmarks',
       'settings',
+      'sessions',
+      'readerProfiles',
     ]) {
       final target = Map<String, dynamic>.from(merged[key] ?? {});
-      target.addAll(Map<String, dynamic>.from(candidate[key] ?? {}));
+      final values = Map<String, dynamic>.from(candidate[key] ?? {});
+      if (key == 'settings') {
+        values.removeWhere(
+          (key, _) =>
+              ['updateHours', 'updateWifi', 'updateNotify'].contains(key),
+        );
+      }
+      target.addAll(values);
       merged[key] = target;
     }
     if (candidate['categories'] != null) {
@@ -488,6 +940,8 @@ class Library extends ChangeNotifier {
         ...List<String>.from(candidate['categories']),
       }.toList();
     }
+    // Preserve live queue references: a restore can finish while a page is in flight.
+    merged['downloads'] = section('downloads');
     data = merged;
     try {
       await persist();

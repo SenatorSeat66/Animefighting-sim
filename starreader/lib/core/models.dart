@@ -1,6 +1,7 @@
 class Manga {
   final String id, title, cover, description, author, status, source;
   final List<String> tags;
+  final Map<String, dynamic> metadata;
   const Manga({
     required this.id,
     required this.title,
@@ -10,6 +11,7 @@ class Manga {
     this.status = '',
     this.source = 'mangadex',
     this.tags = const [],
+    this.metadata = const {},
   });
   Map<String, dynamic> toJson() => {
     'id': id,
@@ -20,6 +22,7 @@ class Manga {
     'status': status,
     'source': source,
     'tags': tags,
+    'metadata': metadata,
   };
   factory Manga.fromJson(Map<String, dynamic> j) => Manga(
     id: j['id'] as String,
@@ -30,12 +33,14 @@ class Manga {
     status: j['status'] as String? ?? '',
     source: j['source'] as String? ?? 'mangadex',
     tags: List<String>.from(j['tags'] ?? []),
+    metadata: Map<String, dynamic>.from(j['metadata'] ?? {}),
   );
 }
 
 class Chapter {
   final String id, mangaId, title, number, language;
   final int pages;
+  final Map<String, dynamic> metadata;
   const Chapter({
     required this.id,
     required this.mangaId,
@@ -43,6 +48,7 @@ class Chapter {
     this.number = '',
     this.language = 'en',
     this.pages = 0,
+    this.metadata = const {},
   });
   Map<String, dynamic> toJson() => {
     'id': id,
@@ -51,6 +57,7 @@ class Chapter {
     'number': number,
     'language': language,
     'pages': pages,
+    'metadata': metadata,
   };
   factory Chapter.fromJson(Map<String, dynamic> j) => Chapter(
     id: j['id'] as String,
@@ -59,6 +66,7 @@ class Chapter {
     number: j['number'] as String? ?? '',
     language: j['language'] as String? ?? 'en',
     pages: j['pages'] as int? ?? 0,
+    metadata: Map<String, dynamic>.from(j['metadata'] ?? {}),
   );
 }
 

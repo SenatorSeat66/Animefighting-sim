@@ -1,0 +1,6 @@
+StarReader includes and adapts Mihon / Tachiyomi source API, networking helpers, Rx coroutine bridge and class loader.
+Copyright Mihon and Tachiyomi contributors. Apache License 2.0.
+Source: https://github.com/mihonapp/mihon
+Revision: 524fa53043f2f5b2321ea13027e44f093ab4245c
+Changes: standalone StarReader NetworkHelper and AppInfo; Compose marker removed; class-loader backport used on SDK24+; host bridge authored for StarReader.
+Additional adaptations: JavaScriptEngine delegates to source-built QuickJS with bounded execution; CloudflareInterceptor reports manual browser authentication requirements without automatic challenge bypass. StarReader UI, repository parser, backup importer and Android bridge are original implementations.
