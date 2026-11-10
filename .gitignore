@@ -1,0 +1,14 @@
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Bb]uilds/
+*.csproj
+*.sln
+*.keystore
+*.jks
+.env
+
+*-build.log
+*.blend1
